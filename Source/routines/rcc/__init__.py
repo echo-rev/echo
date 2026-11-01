@@ -1,0 +1,316 @@
+import io
+from typing import IO, override
+import dataclasses
+import subprocess
+import threading
+import time
+import json
+import os
+
+# Local application/library specific imports
+from config_type.types import structs, wrappers, callable
+from .. import _logic as logic
+import util.const as const
+import assets.serialisers
+import util.resource
+import util.versions
+import logger
+
+from . import (
+    startup_scripts,
+    log_action,
+)
+
+
+@dataclasses.dataclass(kw_only=True, unsafe_hash=True)
+class obj_type(logic.bin_entry, logic.gameconfig_entry):
+    BIN_SUBTYPE = util.resource.bin_subtype.SERVER
+    DIRS_TO_ADD = ['logs', 'LocalStorage']
+
+    track_file_changes: bool = True
+    rcc_port: int
+
+    # TODO: expand place idens to work with multiple at a time.
+    place_iden: int = const.PLACE_IDEN_CONST
+
+    @override
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        (
+            self.web_port, self.rcc_port,
+        ) = self.maybe_differenciate_web_and_rcc_stuff(
+            self.web_port, self.rcc_port,
+        )
+
+    @override
+    def get_base_url(self) -> str:
+        return f'https://{self.web_host}:{self.web_port}'
+
+    @override
+    def get_app_base_url(self) -> str:
+        return f'{self.get_base_url()}/'
+
+    @override
+    def retr_version(self) -> util.versions.rōblox:
+        return self.game_config.game_setup.roblox_version
+
+    def save_thumbnail(self) -> None:
+        '''
+        Saves the thumbnail data for the current game config.
+        '''
+        config = self.game_config
+        cache = config.asset_cache
+        icon_uri = config.server_core.metadata.icon_uri
+        if icon_uri is None:
+            return
+
+        try:
+            thumbnail_data = icon_uri.extract() or bytes()
+            cache.add_asset(const.THUMBNAIL_ID_CONST, thumbnail_data)
+        except Exception as _:
+            self.logger_obj.log(
+                text='Warning: thumbnail data not found.',
+                context=logger.log_context.PYTHON_SETUP,
+            )
+
+    def save_place_file(self) -> None:
+        '''
+        Parses and copies the place file (specified in the config file) to the asset cache.
+        '''
+        config = self.game_config
+        place_uri = config.server_core.place_file.rbxl_uri
+
+        cache = config.asset_cache
+        raw_data = place_uri.extract()
+        if raw_data is None:
+            raise Exception(f'Failed to extract data from {place_uri}.')
+
+        # Parses the raw data as binary or XML, whichever it is, so both get converted.
+        rbxl_data, _changed = assets.serialisers.parse(
+            raw_data, {assets.serialisers.method.rbxl, assets.serialisers.method.rbxlx}
+        )
+
+        # Saves `rbxl_data` to a local file in `AssetCache`.
+        cache.add_asset(
+            self.place_iden,
+            rbxl_data,
+        )
+
+        if (
+            place_uri.uri_type != wrappers.uri_type.LOCAL and
+            config.server_core.place_file.enable_saveplace
+        ):
+            self.logger_obj.log(
+                (
+                    'Warning: config option "enable_saveplace" is redundant '
+                    'when the place file is an online resource.'
+                ),
+                context=logger.log_context.PYTHON_SETUP,
+            )
+
+    def save_starter_scripts(self) -> None:
+        server_path = self.get_versioned_path(os.path.join(
+            'Content',
+            'Scripts',
+            'CoreScripts',
+            'RFDStarterScript.lua',
+        ))
+        with open(server_path, 'w', encoding='utf-8') as f:
+            startup_script = startup_scripts.get_script(self.game_config)
+            f.write(startup_script)
+
+    @override
+    def get_local_fvar_path(self) -> str:
+        match self.retr_version():
+            case util.versions.rōblox.v347:
+                return self.get_versioned_path(
+                    'ClientSettings',
+                    'RCCService.json',
+                )
+            case util.versions.rōblox.v463:
+                return self.get_versioned_path(
+                    'ClientSettings',
+                    'RCCFlagOverride.json',
+                )
+
+    def save_gameserver(self) -> str:
+        '''
+        Saves `GameServer.json`, which will be used when the RCC process is created.
+        '''
+        base_url = self.get_base_url()
+        path = self.get_versioned_path('GameServer.json')
+
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "Mode": "GameServer",
+                "GameId": 13058,
+                "Settings": {
+                    "Type":
+                        "Avatar",
+                    "PlaceId":
+                        self.place_iden,
+                    "GameId":
+                        "Test",
+                    "MachineAddress":
+                        base_url,
+                    "PlaceFetchUrl":
+                        f"{base_url}/asset/?id={self.place_iden}",
+                    "MaxPlayers":
+                        int(1e9),
+                    "PreferredPlayerCapacity":
+                        int(1e9),
+                    "CharacterAppearance":
+                        f"{base_url}/v1.1/avatar-fetch",
+                    "MaxGameInstances":
+                        1,
+                    "GsmInterval":
+                        5,
+                    "ApiKey":
+                        "",
+                    "DataCenterId":
+                        "69420",
+                    "PlaceVisitAccessKey":
+                        "",
+                    "UniverseId":
+                        13058,
+                    "MatchmakingContextId":
+                        1,
+                    "CreatorId":
+                        0,
+                    "CreatorType":
+                        "Group",
+                    "PlaceVersion":
+                        1,
+                    "BaseUrl":
+                        f"{base_url}/.127.0.0.1",
+                    "JobId":
+                        "Test",
+                    "PreferredPort":
+                        self.rcc_port,
+                },
+                "Arguments": {},
+            }, f)
+        return path
+
+    def gen_cmd_args(self) -> tuple[str, ...]:
+        suffix_args: list[str] = []
+
+        # There is a chance that RFD can be overwhelmed with processing output.
+        # Removing the `-verbose` flag here will reduce the amount of data piped from RCC.
+        if not self.logger_obj.bin_logs.is_empty():
+            suffix_args.append('-verbose')
+
+        return (
+            f'-PlaceId:{self.place_iden}',
+            '-LocalTest', self.get_versioned_path(
+                'GameServer.json',
+                make_into_winepath=True,
+            ),
+            *suffix_args,
+        )
+
+    def read_rcc_output(self) -> None:
+        '''
+        Pipes output from the RCC server to the logger module for processing.
+        This is done in a separate thread to avoid blocking the main process from terminating RCC when necessary.
+        '''
+        proc = self.popen_mains[0]
+        stdout = proc.stdout
+        if stdout is None:
+            return
+        assert stdout is not None
+
+        while True:
+            line = stdout.readline()
+
+            self.logger_obj.log(
+                line.rstrip(b'\r\n'),
+                context=logger.log_context.RCC_SERVER,
+            )
+
+            action = log_action.check(line)
+
+            # The `restart` and `kill` methods must take place in a new thread.
+            # It waits for *this* thread to finish running.
+            match action:
+                case log_action.LogAction.RESTART:
+                    threading.Thread(target=self.restart).start()
+                    break
+                case log_action.LogAction.TERMINATE:
+                    threading.Thread(target=self.kill).start()
+                    break
+                case log_action.LogAction.READY:
+                    # TODO: make RCC logging more speedy.
+                    pass
+                case log_action.LogAction.PROCEED:
+                    pass
+
+        stdout.flush()
+
+    def make_popen_threads(self) -> None:
+        self.init_popen(
+            exe_path=self.get_versioned_path('RCCService.exe'),
+            cmd_args=self.gen_cmd_args(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        pipe_thread = threading.Thread(
+            target=self.read_rcc_output,
+            daemon=True,
+        )
+        pipe_thread.start()
+
+        file_change_thread = threading.Thread(
+            target=self.maybe_track_file_changes,
+            daemon=True,
+        )
+        file_change_thread.start()
+
+        self.threads.extend([
+            pipe_thread,
+            file_change_thread,
+        ])
+
+    def maybe_track_file_changes(self) -> None:
+        config = self.game_config
+        if not config.server_core.place_file.track_file_changes:
+            return
+
+        place_uri = config.server_core.place_file.rbxl_uri
+        if place_uri.uri_type != wrappers.uri_type.LOCAL:
+            return
+
+        file_path = place_uri.value
+        last_modified = os.path.getmtime(file_path)
+
+        while self.is_running and not self.is_terminated:
+            current_modified = os.path.getmtime(file_path)
+            if current_modified == last_modified:
+                time.sleep(1)
+                continue
+            # The `restart` method must take place in a new thread.
+            # It waits for *this* thread to finish running.
+            threading.Thread(target=self.restart).start()
+            return
+
+    @override
+    def bootstrap(self) -> None:
+        super().bootstrap()
+        self.save_starter_scripts()
+        self.save_place_file()
+        self.save_thumbnail()
+        self.save_gameserver()
+
+        self.logger_obj.log(
+            (
+                f"{self.logger_obj.bcolors.BOLD}[UDP %d]{self.logger_obj.bcolors.ENDC}: " +
+                "initialising Rōblox Cloud Compute"
+            ) % (
+                self.rcc_port,
+            ),
+            context=logger.log_context.PYTHON_SETUP,
+        )
+
+        self.make_popen_threads()

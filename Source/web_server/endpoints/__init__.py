@@ -1,0 +1,35 @@
+from web_server._logic import server_path, web_server_handler
+import util.const
+
+from . import (
+    assets,
+    avatar,
+    badges,
+    data_transfer,
+    funds,
+    groups,
+    join_data,
+    marketplace,
+    persistence,
+    player_info,
+    playtime,
+    save_place,
+    setup_player,
+    text_filter,
+    studio,
+    misc,
+    fvars,
+)
+
+
+@server_path("/")
+def _(self: web_server_handler) -> bool:
+    data_string = (
+        'Echo game server %s [%s] (built on Roblox Freedom Distribution)' %
+        (
+            util.const.GIT_RELEASE_VERSION,
+            self.game_config.game_setup.roblox_version.value[0],
+        )
+    )
+    self.send_data(data_string.encode('utf-8'))
+    return True
